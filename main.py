@@ -1,731 +1,257 @@
-# Root cause: triple-quoted docstrings inside the code got corrupted during copy-paste.
-# Fix: rewrite the entire file using ONLY single-line # comments — zero triple quotes anywhere.
-
-code = (
-'# DUAL SIGNAL BOT - Merged Final Version\n'
-'# Regime-aware: TRENDING / SIDEWAYS / VOLATILE\n'
-'# Telegram inline buttons: Take Trade / Skip / Remind\n'
-'\n'
-'import os\n'
-'import time\n'
-'import uuid\n'
-'import logging\n'
-'import threading\n'
-'import requests\n'
-'import yfinance as yf\n'
-'import pandas   as pd\n'
-'import pytz\n'
-'from datetime import datetime, date, timedelta\n'
-'from dotenv   import load_dotenv\n'
-'\n'
-'load_dotenv()\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  CONFIG\n'
-'# --------------------------------------------------\n'
-'BOT_TOKEN = os.environ.get("BOT_TOKEN")\n'
-'CHAT_ID   = os.environ.get("CHAT_ID")\n'
-'\n'
-'if not BOT_TOKEN or not CHAT_ID:\n'
-'    raise ValueError("BOT_TOKEN and CHAT_ID must be set as environment variables.")\n'
-'\n'
-'CAPITAL        = float(os.environ.get("CAPITAL", 30000))\n'
-'RISK_PCT       = 0.005\n'
-'MAX_DAILY_LOSS = CAPITAL * 0.02\n'
-'MIN_CONFIDENCE = 6\n'
-'IST            = pytz.timezone("Asia/Kolkata")\n'
-'\n'
-'SYMBOLS = {\n'
-'    "NIFTY": {\n'
-'        "yahoo":      "^NSEI",\n'
-'        "interval":   50,\n'
-'        "lot":        75,\n'
-'        "expiry_day": 1,\n'
-'    },\n'
-'    "BANKNIFTY": {\n'
-'        "yahoo":      "^NSEBANK",\n'
-'        "interval":   100,\n'
-'        "lot":        35,\n'
-'        "expiry_day": None,\n'
-'    },\n'
-'}\n'
-'\n'
-'STRATEGY_RANK = {"TRENDING": 3, "VOLATILE": 2, "SIDEWAYS": 1}\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  LOGGING\n'
-'# --------------------------------------------------\n'
-'logging.basicConfig(\n'
-'    level=logging.INFO,\n'
-'    format="%(asctime)s [%(levelname)s] %(message)s",\n'
-'    handlers=[\n'
-'        logging.FileHandler("bot.log"),\n'
-'        logging.StreamHandler(),\n'
-'    ],\n'
-')\n'
-'log = logging.getLogger("SignalBot")\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  THREAD-SAFE STATE\n'
-'# --------------------------------------------------\n'
-'_lock = threading.Lock()\n'
-'\n'
-'regime_state = {name: {"last": None, "count": 0} for name in SYMBOLS}\n'
-'\n'
-'state = {\n'
-'    "active_trade":        None,\n'
-'    "pending_signals":     {},\n'
-'    "daily_loss":          0.0,\n'
-'    "current_day":         None,\n'
-'    "rules_sent":          {"open": False, "mid": False, "close": False},\n'
-'    "last_heartbeat_hour": -1,\n'
-'    "holiday_sent":        False,\n'
-'}\n'
-'\n'
-'def get_st(key):\n'
-'    with _lock:\n'
-'        return state[key]\n'
-'\n'
-'def set_st(key, val):\n'
-'    with _lock:\n'
-'        state[key] = val\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  TELEGRAM HELPERS\n'
-'# --------------------------------------------------\n'
-'def _tg(endpoint, payload):\n'
-'    try:\n'
-'        r = requests.post(\n'
-'            f"https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}",\n'
-'            json=payload, timeout=10,\n'
-'        )\n'
-'        return r.json()\n'
-'    except Exception as e:\n'
-'        log.error(f"Telegram error ({endpoint}): {e}")\n'
-'        return {}\n'
-'\n'
-'def send_text(text):\n'
-'    res = _tg("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})\n'
-'    return res.get("result", {}).get("message_id")\n'
-'\n'
-'def send_with_buttons(text, signal_id):\n'
-'    keyboard = {\n'
-'        "inline_keyboard": [\n'
-'            [\n'
-'                {"text": "Take Trade", "callback_data": f"take|{signal_id}"},\n'
-'                {"text": "Skip",       "callback_data": f"skip|{signal_id}"},\n'
-'            ],\n'
-'            [\n'
-'                {"text": "Remind in 5 min", "callback_data": f"remind|{signal_id}"},\n'
-'            ],\n'
-'        ]\n'
-'    }\n'
-'    res = _tg("sendMessage", {\n'
-'        "chat_id":      CHAT_ID,\n'
-'        "text":         text,\n'
-'        "parse_mode":   "Markdown",\n'
-'        "reply_markup": keyboard,\n'
-'    })\n'
-'    return res.get("result", {}).get("message_id")\n'
-'\n'
-'def edit_message(message_id, text, keep_buttons=False):\n'
-'    payload = {\n'
-'        "chat_id":    CHAT_ID,\n'
-'        "message_id": message_id,\n'
-'        "text":       text,\n'
-'        "parse_mode": "Markdown",\n'
-'    }\n'
-'    if not keep_buttons:\n'
-'        payload["reply_markup"] = {"inline_keyboard": []}\n'
-'    _tg("editMessageText", payload)\n'
-'\n'
-'def answer_callback(callback_id, text=""):\n'
-'    _tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text, "show_alert": False})\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  CALLBACK HANDLER\n'
-'# --------------------------------------------------\n'
-'def handle_callback(query):\n'
-'    cb_id      = query["id"]\n'
-'    data       = query.get("data", "")\n'
-'    message_id = query.get("message", {}).get("message_id")\n'
-'\n'
-'    if "|" not in data:\n'
-'        answer_callback(cb_id, "Unknown action")\n'
-'        return\n'
-'\n'
-'    action, signal_id = data.split("|", 1)\n'
-'    pending = get_st("pending_signals")\n'
-'    signal  = pending.get(signal_id)\n'
-'\n'
-'    if not signal:\n'
-'        answer_callback(cb_id, "Signal expired or already handled")\n'
-'        if message_id:\n'
-'            edit_message(message_id, "Signal expired - already handled or timed out.")\n'
-'        return\n'
-'\n'
-'    if action == "take":\n'
-'        with _lock:\n'
-'            if state["active_trade"]:\n'
-'                ex = state["active_trade"]\n'
-'                answer_callback(cb_id, "Trade already open!")\n'
-'                edit_message(message_id,\n'
-'                    f"Blocked - already have open trade:\\n"\n'
-'                    f"{ex[\'symbol\']} {ex[\'atm_strike\']} {ex[\'direction\']}\\n"\n'
-'                    f"Close that first."\n'
-'                )\n'
-'                return\n'
-'            state["active_trade"] = signal\n'
-'            del state["pending_signals"][signal_id]\n'
-'\n'
-'        answer_callback(cb_id, "Trade logged!")\n'
-'        s = signal\n'
-'        edit_message(message_id,\n'
-'            f"*Trade Taken*\\n\\n"\n'
-'            f"*{s[\'symbol\']}* {s[\'atm_strike\']} {s[\'direction\']}\\n"\n'
-'            f"Regime: {s[\'regime\']}\\n"\n'
-'            f"Strategy: {s[\'strategy\']}\\n\\n"\n'
-'            f"Entry est : Rs.{s[\'atm_prem\']} per unit\\n"\n'
-'            f"Stop Loss : Rs.{s[\'sl_prem\']}\\n"\n'
-'            f"Target    : Rs.{s[\'tgt_prem\']}\\n"\n'
-'            f"Lot size  : {s[\'lot\']} units\\n\\n"\n'
-'            f"Bot will notify when SL or Target is hit."\n'
-'        )\n'
-'        log.info(f"Trade taken: {s[\'symbol\']} {s[\'atm_strike\']} {s[\'direction\']}")\n'
-'\n'
-'    elif action == "skip":\n'
-'        with _lock:\n'
-'            pending.pop(signal_id, None)\n'
-'        answer_callback(cb_id, "Skipped")\n'
-'        s = signal\n'
-'        edit_message(message_id,\n'
-'            f"Skipped: {s[\'symbol\']} {s[\'atm_strike\']} {s[\'direction\']}\\n"\n'
-'            f"Watching for next signal..."\n'
-'        )\n'
-'        log.info(f"Signal skipped: {s[\'symbol\']} {s[\'atm_strike\']} {s[\'direction\']}")\n'
-'\n'
-'    elif action == "remind":\n'
-'        answer_callback(cb_id, "Will remind at next scan")\n'
-'        if message_id:\n'
-'            edit_message(message_id,\n'
-'                f"Reminder set: {signal[\'symbol\']} {signal[\'atm_strike\']} {signal[\'direction\']}\\n"\n'
-'                f"Bot will re-alert in ~5 min.",\n'
-'                keep_buttons=True,\n'
-'            )\n'
-'    else:\n'
-'        answer_callback(cb_id, "Unknown action")\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  TELEGRAM POLLING THREAD\n'
-'# --------------------------------------------------\n'
-'def telegram_polling_thread():\n'
-'    log.info("Telegram polling thread started")\n'
-'    offset = 0\n'
-'    while True:\n'
-'        try:\n'
-'            resp = requests.get(\n'
-'                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",\n'
-'                params={"offset": offset, "timeout": 25, "allowed_updates": ["callback_query"]},\n'
-'                timeout=30,\n'
-'            )\n'
-'            for upd in resp.json().get("result", []):\n'
-'                offset = upd["update_id"] + 1\n'
-'                if "callback_query" in upd:\n'
-'                    try:\n'
-'                        handle_callback(upd["callback_query"])\n'
-'                    except Exception as e:\n'
-'                        log.error(f"Callback error: {e}")\n'
-'        except requests.exceptions.Timeout:\n'
-'            pass\n'
-'        except Exception as e:\n'
-'            log.error(f"Polling thread error: {e}")\n'
-'            time.sleep(5)\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  INDICATORS\n'
-'# --------------------------------------------------\n'
-'def compute_indicators(df):\n'
-'    df = df.copy()\n'
-'    df["ema9"]  = df["Close"].ewm(span=9,  adjust=False).mean()\n'
-'    df["ema21"] = df["Close"].ewm(span=21, adjust=False).mean()\n'
-'    delta       = df["Close"].diff()\n'
-'    gain        = delta.clip(lower=0).rolling(14).mean()\n'
-'    loss        = (-delta.clip(upper=0)).rolling(14).mean()\n'
-'    df["rsi"]   = 100 - (100 / (1 + gain / loss.replace(0, 1e-9)))\n'
-'    df["atr"]   = (df["High"] - df["Low"]).rolling(10).mean()\n'
-'    cum_vol     = df["Volume"].cumsum()\n'
-'    cum_pv      = (df["Close"] * df["Volume"]).cumsum()\n'
-'    df["vwap"]  = cum_pv / cum_vol.replace(0, 1e-9)\n'
-'    return df\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  REGIME DETECTION\n'
-'# --------------------------------------------------\n'
-'def detect_regime(df, atr, ema9, ema21):\n'
-'    recent   = df.iloc[-10:]\n'
-'    rng      = recent["High"].max() - recent["Low"].min()\n'
-'    ema_diff = abs(ema9 - ema21)\n'
-'    if ema_diff > atr * 0.6 and rng > atr * 4:\n'
-'        return "TRENDING"\n'
-'    if ema_diff < atr * 0.3 and rng < atr * 3:\n'
-'        return "SIDEWAYS"\n'
-'    if rng > atr * 5:\n'
-'        return "VOLATILE"\n'
-'    return "NORMAL"\n'
-'\n'
-'def confirm_regime(symbol, new_regime):\n'
-'    rs = regime_state[symbol]\n'
-'    if rs["last"] == new_regime:\n'
-'        rs["count"] += 1\n'
-'    else:\n'
-'        rs["last"]  = new_regime\n'
-'        rs["count"] = 1\n'
-'    return new_regime if rs["count"] >= 2 else None\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  STRATEGIES\n'
-'# --------------------------------------------------\n'
-'def strategy_breakout(df, atr, ema9, ema21, rsi, vwap):\n'
-'    orb_high = float(df.iloc[:3]["High"].max())\n'
-'    orb_low  = float(df.iloc[:3]["Low"].min())\n'
-'    close    = float(df.iloc[-1]["Close"])\n'
-'    conf = 0\n'
-'    if close > orb_high or close < orb_low:\n'
-'        conf += 3\n'
-'    if (ema9 > ema21 and close > orb_high) or (ema9 < ema21 and close < orb_low):\n'
-'        conf += 3\n'
-'    if (rsi > 55 and close > orb_high) or (rsi < 45 and close < orb_low):\n'
-'        conf += 2\n'
-'    if conf < MIN_CONFIDENCE:\n'
-'        return None\n'
-'    if close > orb_high and close > vwap and ema9 > ema21:\n'
-'        return "CE", close, close - atr, close + atr * 2, conf\n'
-'    if close < orb_low and close < vwap and ema9 < ema21:\n'
-'        return "PE", close, close + atr, close - atr * 2, conf\n'
-'    return None\n'
-'\n'
-'def strategy_range_trade(df, atr, ema9, ema21, rsi):\n'
-'    recent = df.iloc[-10:]\n'
-'    high   = float(recent["High"].max())\n'
-'    low    = float(recent["Low"].min())\n'
-'    close  = float(df.iloc[-1]["Close"])\n'
-'    buffer = atr * 0.3\n'
-'    conf = 0\n'
-'    if abs(ema9 - ema21) < atr * 0.3:\n'
-'        conf += 3\n'
-'    if close <= low + buffer or close >= high - buffer:\n'
-'        conf += 3\n'
-'    if (close <= low + buffer and rsi < 40) or (close >= high - buffer and rsi > 60):\n'
-'        conf += 2\n'
-'    if conf < MIN_CONFIDENCE:\n'
-'        return None\n'
-'    if close <= low + buffer:\n'
-'        return "CE", close, close - atr * 0.8, close + atr * 1.2, conf\n'
-'    if close >= high - buffer:\n'
-'        return "PE", close, close + atr * 0.8, close - atr * 1.2, conf\n'
-'    return None\n'
-'\n'
-'def strategy_momentum(df, atr, rsi):\n'
-'    last  = df.iloc[-1]\n'
-'    body  = abs(float(last["Close"]) - float(last["Open"]))\n'
-'    rng   = float(last["High"]) - float(last["Low"])\n'
-'    close = float(last["Close"])\n'
-'    conf = 0\n'
-'    if rng > 0 and body > rng * 0.7:\n'
-'        conf += 3\n'
-'    if atr > float(df["atr"].iloc[-6:-1].mean()) * 1.4:\n'
-'        conf += 3\n'
-'    if (last["Close"] > last["Open"] and rsi > 60) or (last["Close"] < last["Open"] and rsi < 40):\n'
-'        conf += 2\n'
-'    if conf < MIN_CONFIDENCE:\n'
-'        return None\n'
-'    if last["Close"] > last["Open"]:\n'
-'        return "CE", close, close - atr * 1.3, close + atr * 2.5, conf\n'
-'    return "PE", close, close + atr * 1.3, close - atr * 2.5, conf\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  EXPIRY HELPERS\n'
-'# --------------------------------------------------\n'
-'def days_to_expiry(name):\n'
-'    cfg     = SYMBOLS.get(name, {})\n'
-'    exp_day = cfg.get("expiry_day")\n'
-'    today   = datetime.now(IST).date()\n'
-'    if exp_day is None:\n'
-'        d, last_thu = date(today.year, today.month, 1), None\n'
-'        while d.month == today.month:\n'
-'            if d.weekday() == 3:\n'
-'                last_thu = d\n'
-'            d += timedelta(days=1)\n'
-'        if last_thu and last_thu >= today:\n'
-'            return (last_thu - today).days\n'
-'        nm = today.month % 12 + 1\n'
-'        yr = today.year + (1 if nm == 1 else 0)\n'
-'        d, last_thu = date(yr, nm, 1), None\n'
-'        while d.month == nm:\n'
-'            if d.weekday() == 3:\n'
-'                last_thu = d\n'
-'            d += timedelta(days=1)\n'
-'        return (last_thu - today).days if last_thu else 30\n'
-'    diff = (exp_day - today.weekday()) % 7\n'
-'    return diff if diff > 0 else 7\n'
-'\n'
-'def is_expiry_today(name):\n'
-'    cfg     = SYMBOLS.get(name, {})\n'
-'    exp_day = cfg.get("expiry_day")\n'
-'    if exp_day is None:\n'
-'        return False\n'
-'    return datetime.now(IST).weekday() == exp_day\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  PREMIUM ESTIMATOR\n'
-'# --------------------------------------------------\n'
-'def estimate_premium(spot, strike, opt_type, dte):\n'
-'    iv        = 0.14\n'
-'    intrinsic = max(0, spot - strike) if opt_type == "CE" else max(0, strike - spot)\n'
-'    time_val  = round(spot * iv * max(dte, 1) / 365)\n'
-'    return max(10, round(intrinsic + time_val))\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  SIGNAL SCANNER\n'
-'# --------------------------------------------------\n'
-'def scan_symbol(name):\n'
-'    cfg      = SYMBOLS[name]\n'
-'    interval = cfg["interval"]\n'
-'    lot      = cfg["lot"]\n'
-'    try:\n'
-'        df = yf.download(cfg["yahoo"], interval="5m", period="1d", progress=False, auto_adjust=True)\n'
-'        if df.empty:\n'
-'            log.warning(f"{name}: No data")\n'
-'            return None\n'
-'        if isinstance(df.columns, pd.MultiIndex):\n'
-'            df.columns = df.columns.get_level_values(0)\n'
-'        df = df.dropna()\n'
-'        if len(df) < 20:\n'
-'            log.warning(f"{name}: Too few candles ({len(df)})")\n'
-'            return None\n'
-'        df    = compute_indicators(df)\n'
-'        last  = df.iloc[-1]\n'
-'        close = float(last["Close"])\n'
-'        atr   = float(last["atr"])\n'
-'        ema9  = float(last["ema9"])\n'
-'        ema21 = float(last["ema21"])\n'
-'        rsi   = float(last["rsi"])\n'
-'        vwap  = float(last["vwap"])\n'
-'        raw_regime = detect_regime(df, atr, ema9, ema21)\n'
-'        regime     = confirm_regime(name, raw_regime)\n'
-'        if not regime or regime == "NORMAL":\n'
-'            log.info(f"{name}: Regime={raw_regime} not confirmed - skip")\n'
-'            return None\n'
-'        if regime == "TRENDING":\n'
-'            result   = strategy_breakout(df, atr, ema9, ema21, rsi, vwap)\n'
-'            strategy = "ORB Breakout"\n'
-'        elif regime == "SIDEWAYS":\n'
-'            result   = strategy_range_trade(df, atr, ema9, ema21, rsi)\n'
-'            strategy = "Range Fade"\n'
-'        else:\n'
-'            result   = strategy_momentum(df, atr, rsi)\n'
-'            strategy = "Momentum"\n'
-'        if result is None:\n'
-'            log.info(f"{name}: {regime} confirmed but no setup found")\n'
-'            return None\n'
-'        direction, entry, sl_idx, tgt_idx, conf = result\n'
-'        atm_strike = round(close / interval) * interval\n'
-'        otm_strike = (atm_strike + interval) if direction == "CE" else (atm_strike - interval)\n'
-'        dte        = days_to_expiry(name)\n'
-'        atm_prem   = estimate_premium(close, atm_strike, direction, max(1, dte))\n'
-'        if is_expiry_today(name):\n'
-'            sl_prem  = round(atm_prem * 0.35)\n'
-'            tgt_prem = round(atm_prem * 1.60)\n'
-'        else:\n'
-'            sl_prem  = round(atm_prem * 0.45)\n'
-'            tgt_prem = round(atm_prem * 1.90)\n'
-'        risk_per_lot = max(1, (atm_prem - sl_prem) * lot)\n'
-'        sugg_lots    = max(1, int((CAPITAL * RISK_PCT) / risk_per_lot))\n'
-'        return {\n'
-'            "id":           str(uuid.uuid4())[:8],\n'
-'            "symbol":       name,\n'
-'            "direction":    direction,\n'
-'            "confidence":   conf,\n'
-'            "regime":       regime,\n'
-'            "strategy":     strategy,\n'
-'            "close":        round(close, 2),\n'
-'            "atm_strike":   atm_strike,\n'
-'            "otm_strike":   otm_strike,\n'
-'            "atm_prem":     atm_prem,\n'
-'            "sl_prem":      sl_prem,\n'
-'            "tgt_prem":     tgt_prem,\n'
-'            "sugg_lots":    sugg_lots,\n'
-'            "lot":          lot,\n'
-'            "sl_idx":       round(sl_idx, 2),\n'
-'            "tgt_idx":      round(tgt_idx, 2),\n'
-'            "atr":          round(atr, 2),\n'
-'            "rsi":          round(rsi, 1),\n'
-'            "ema9":         round(ema9, 2),\n'
-'            "ema21":        round(ema21, 2),\n'
-'            "vwap":         round(vwap, 2),\n'
-'            "dte":          dte,\n'
-'            "expiry_today": is_expiry_today(name),\n'
-'            "yahoo":        cfg["yahoo"],\n'
-'        }\n'
-'    except Exception as e:\n'
-'        log.error(f"{name}: scan_symbol error - {e}")\n'
-'        return None\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  SL / TARGET MONITORING\n'
-'# --------------------------------------------------\n'
-'def check_sl_target():\n'
-'    trade = get_st("active_trade")\n'
-'    if not trade:\n'
-'        return\n'
-'    sym  = trade["symbol"]\n'
-'    dire = trade["direction"]\n'
-'    sl   = trade["sl_idx"]\n'
-'    tgt  = trade["tgt_idx"]\n'
-'    try:\n'
-'        df = yf.download(trade["yahoo"], interval="1m", period="1d", progress=False, auto_adjust=True)\n'
-'        if df.empty:\n'
-'            return\n'
-'        if isinstance(df.columns, pd.MultiIndex):\n'
-'            df.columns = df.columns.get_level_values(0)\n'
-'        live    = float(df["Close"].dropna().iloc[-1])\n'
-'        sl_hit  = (live <= sl)  if dire == "CE" else (live >= sl)\n'
-'        tgt_hit = (live >= tgt) if dire == "CE" else (live <= tgt)\n'
-'        log.info(f"SL/Tgt - {sym}: live={live:.2f} SL={sl} Tgt={tgt}")\n'
-'        if sl_hit:\n'
-'            send_text(\n'
-'                f"STOP LOSS HIT\\n\\n"\n'
-'                f"{sym} {trade[\'atm_strike\']} {dire}\\n"\n'
-'                f"Index now: {live:,.2f}\\n"\n'
-'                f"SL level : {sl:,.2f}\\n\\n"\n'
-'                f"EXIT NOW. No waiting."\n'
-'            )\n'
-'            with _lock:\n'
-'                state["daily_loss"]  += CAPITAL * RISK_PCT\n'
-'                state["active_trade"] = None\n'
-'            log.info(f"SL hit: {sym} {trade[\'atm_strike\']} {dire}")\n'
-'        elif tgt_hit:\n'
-'            send_text(\n'
-'                f"TARGET HIT\\n\\n"\n'
-'                f"{sym} {trade[\'atm_strike\']} {dire}\\n"\n'
-'                f"Index now: {live:,.2f}\\n"\n'
-'                f"Tgt level: {tgt:,.2f}\\n\\n"\n'
-'                f"BOOK PROFIT NOW."\n'
-'            )\n'
-'            with _lock:\n'
-'                state["active_trade"] = None\n'
-'            log.info(f"Target hit: {sym} {trade[\'atm_strike\']} {dire}")\n'
-'    except Exception as e:\n'
-'        log.error(f"check_sl_target error: {e}")\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  MESSAGE BUILDERS\n'
-'# --------------------------------------------------\n'
-'def build_signal_msg(s):\n'
-'    exp_line = ("EXPIRY DAY - SL tightened. Exit before 2:45 PM."\n'
-'                if s["expiry_today"] else f"{s[\'dte\']} day(s) to expiry")\n'
-'    active = get_st("active_trade")\n'
-'    block  = (\n'
-'        f"\\nActive trade: {active[\'symbol\']} {active[\'atm_strike\']} {active[\'direction\']}\\n"\n'
-'        f"This signal is blocked until you close that trade."\n'
-'        if active else ""\n'
-'    )\n'
-'    return (\n'
-'        f"SIGNAL - {s[\'symbol\']} {s[\'direction\']}\\n"\n'
-'        f"------------------------------\\n\\n"\n'
-'        f"Regime   : {s[\'regime\']}\\n"\n'
-'        f"Strategy : {s[\'strategy\']}\\n"\n'
-'        f"Conf     : {s[\'confidence\']}/8\\n\\n"\n'
-'        f"Index    : {s[\'close\']:,.2f}\\n"\n'
-'        f"EMA9/21  : {s[\'ema9\']:,.2f} / {s[\'ema21\']:,.2f}\\n"\n'
-'        f"RSI      : {s[\'rsi\']:.1f}\\n"\n'
-'        f"VWAP     : {s[\'vwap\']:,.2f}\\n"\n'
-'        f"ATR      : {s[\'atr\']:,.2f}\\n\\n"\n'
-'        f"WHAT TO BUY\\n"\n'
-'        f"ATM Strike : {s[\'atm_strike\']} {s[\'direction\']}\\n"\n'
-'        f"OTM Strike : {s[\'otm_strike\']} {s[\'direction\']} (cheaper)\\n"\n'
-'        f"Entry est  : Rs.{s[\'atm_prem\']} per unit\\n"\n'
-'        f"Stop Loss  : Rs.{s[\'sl_prem\']}\\n"\n'
-'        f"Target     : Rs.{s[\'tgt_prem\']}\\n"\n'
-'        f"Lot size   : {s[\'lot\']} units\\n"\n'
-'        f"Suggested  : {s[\'sugg_lots\']} lot(s) Rs.{int(CAPITAL * RISK_PCT)} risk\\n\\n"\n'
-'        f"{exp_line}"\n'
-'        f"{block}\\n\\n"\n'
-'        f"Tap a button below"\n'
-'    )\n'
-'\n'
-'def build_multi_summary(signals, best):\n'
-'    lines = [f"{len(signals)} signals fired simultaneously\\n"]\n'
-'    for s in signals:\n'
-'        marker = "BEST ->" if s["symbol"] == best["symbol"] else "  -"\n'
-'        lines.append(\n'
-'            f"{marker} {s[\'symbol\']} {s[\'direction\']} {s[\'atm_strike\']}"\n'
-'            f" | {s[\'regime\']} | Conf:{s[\'confidence\']}/8 | Rs.{s[\'atm_prem\']}"\n'
-'        )\n'
-'    lines.append("\\nIndividual signals with buttons follow below")\n'
-'    return "\\n".join(lines)\n'
-'\n'
-'def build_rules_msg(period):\n'
-'    at     = get_st("active_trade")\n'
-'    dl     = get_st("daily_loss")\n'
-'    at_str = (\n'
-'        f"Active trade: {at[\'symbol\']} {at[\'atm_strike\']} {at[\'direction\']}"\n'
-'        if at else "No active trade"\n'
-'    )\n'
-'    if period == "open":\n'
-'        return (\n'
-'            f"Bot Online - Market Open\\n\\n"\n'
-'            f"RULES\\n"\n'
-'            f"1. ONE trade at a time\\n"\n'
-'            f"2. Pick highest confidence signal\\n"\n'
-'            f"3. Never override Stop Loss\\n"\n'
-'            f"4. Exit all positions by 3:15 PM\\n"\n'
-'            f"5. Daily loss limit Rs.{MAX_DAILY_LOSS:.0f} then stop\\n"\n'
-'            f"6. Expiry day: tighter SL, earlier exit\\n\\n"\n'
-'            f"{at_str}"\n'
-'        )\n'
-'    if period == "mid":\n'
-'        return (\n'
-'            f"MIDDAY CHECK\\n\\n"\n'
-'            f"Daily loss used: Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\\n"\n'
-'            f"{at_str}\\n\\n"\n'
-'            f"Stay disciplined. No overtrading."\n'
-'        )\n'
-'    if period == "close":\n'
-'        return (\n'
-'            f"PRE-CLOSE\\n\\n"\n'
-'            f"Daily loss used: Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\\n"\n'
-'            f"{at_str}\\n\\n"\n'
-'            f"No new trades after 3:00 PM.\\n"\n'
-'            f"Close open trades before 3:15 PM."\n'
-'        )\n'
-'    return ""\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  TIME UTILITIES\n'
-'# --------------------------------------------------\n'
-'def now_ist():\n'
-'    return datetime.now(IST)\n'
-'\n'
-'def time_str():\n'
-'    return now_ist().strftime("%H:%M")\n'
-'\n'
-'def wait_next_5min():\n'
-'    n    = now_ist()\n'
-'    secs = n.minute * 60 + n.second\n'
-'    gap  = ((secs // 300) + 1) * 300 - secs\n'
-'    log.info(f"Sleeping {gap}s until next 5-min candle")\n'
-'    time.sleep(gap)\n'
-'\n'
-'def is_trading_window():\n'
-'    n = now_ist()\n'
-'    if n.weekday() >= 5:\n'
-'        return False\n'
-'    m = n.hour * 60 + n.minute\n'
-'    return 9 * 60 + 20 <= m <= 15 * 60 + 25\n'
-'\n'
-'# --------------------------------------------------\n'
-'#  MAIN LOOP\n'
-'# --------------------------------------------------\n'
-'def main():\n'
-'    log.info("=" * 55)\n'
-'    log.info("  Dual Signal Bot  -  Merged Final Version")\n'
-'    log.info("=" * 55)\n'
-'    poll = threading.Thread(target=telegram_polling_thread, daemon=True)\n'
-'    poll.start()\n'
-'    while True:\n'
-'        n    = now_ist()\n'
-'        t    = time_str()\n'
-'        wday = n.weekday()\n'
-'        if wday >= 5:\n'
-'            if not get_st("holiday_sent"):\n'
-'                send_text("Market closed today. See you Monday!")\n'
-'                set_st("holiday_sent", True)\n'
-'            time.sleep(3600)\n'
-'            continue\n'
-'        if get_st("current_day") != n.date():\n'
-'            with _lock:\n'
-'                state.update({\n'
-'                    "current_day":         n.date(),\n'
-'                    "daily_loss":          0.0,\n'
-'                    "active_trade":        None,\n'
-'                    "pending_signals":     {},\n'
-'                    "rules_sent":          {"open": False, "mid": False, "close": False},\n'
-'                    "last_heartbeat_hour": -1,\n'
-'                    "holiday_sent":        False,\n'
-'                })\n'
-'                for nm in regime_state:\n'
-'                    regime_state[nm] = {"last": None, "count": 0}\n'
-'            log.info(f"New day: {n.date()}")\n'
-'        rs = get_st("rules_sent")\n'
-'        if "09:20" <= t < "09:30" and not rs["open"]:\n'
-'            send_text(build_rules_msg("open"))\n'
-'            with _lock:\n'
-'                state["rules_sent"]["open"] = True\n'
-'        if "12:30" <= t < "12:40" and not rs["mid"]:\n'
-'            send_text(build_rules_msg("mid"))\n'
-'            with _lock:\n'
-'                state["rules_sent"]["mid"] = True\n'
-'        if "15:00" <= t < "15:10" and not rs["close"]:\n'
-'            send_text(build_rules_msg("close"))\n'
-'            with _lock:\n'
-'                state["rules_sent"]["close"] = True\n'
-'        if "15:30" <= t < "15:31":\n'
-'            at = get_st("active_trade")\n'
-'            dl = get_st("daily_loss")\n'
-'            send_text(\n'
-'                f"Market Closed\\n\\n"\n'
-'                f"Daily loss: Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\\n"\n'
-'                f"Open trade: {at[\'symbol\'] + \' \' + str(at[\'atm_strike\']) if at else \'None\'}\\n\\n"\n'
-'                f"See you tomorrow at 9:20 AM"\n'
-'            )\n'
-'            set_st("active_trade", None)\n'
-'        if is_trading_window():\n'
-'            if get_st("daily_loss") >= MAX_DAILY_LOSS:\n'
-'                log.info("Daily loss limit - paused this cycle")\n'
-'                wait_next_5min()\n'
-'                continue\n'
-'            check_sl_target()\n'
-'            try:\n'
-'                signals = []\n'
-'                for name in SYMBOLS:\n'
-'                    result = scan_symbol(name)\n'
-'                    if result:\n'
-'                        signals.append(result)\n'
-'                if signals:\n'
-'                    best = max(signals, key=lambda x: (STRATEGY_RANK.get(x["regime"], 0), x["confidence"]))\n'
-'                    if len(signals) > 1:\n'
-'                        send_text(build_multi_summary(signals, best))\n'
-'                    for sig in signals:\n'
-'                        msg_id = send_with_buttons(build_signal_msg(sig), sig["id"])\n'
-'                        with _lock:\n'
-'                            state["pending_signals"][sig["id"]] = {**sig, "msg_id": msg_id}\n'
-'                        log.info(f"Signal: {sig[\'symbol\']} {sig[\'direction\']} {sig[\'atm_strike\']} [{sig[\'regime\']}] conf={sig[\'confidence\']}/8")\n'
-'                else:\n'
-'                    log.info("No confirmed signals this scan")\n'
-'            except Exception as e:\n'
-'                log.error(f"Main scan error: {e}")\n'
-'        wait_next_5min()\n'
-'\n'
-'\n'
-'if __name__ == "__main__":\n'
-'    main()\n'
-)
-
 import os
-os.makedirs('/root/output', exist_ok=True)
-with open('/root/output/main.py', 'w', encoding='utf-8') as f:
-    f.write(code)
+import time
+import uuid
+import logging
+import threading
+import requests
+import yfinance as yf
+import pandas as pd
+import pytz
+from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+load_dotenv()
 
-# Verify no triple quotes exist
-assert '"""' not in code, "Triple double-quotes found!"
-assert "'''" not in code, "Triple single-quotes found!"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("BOT_TOKEN and CHAT_ID must be set as environment variables.")
+CAPITAL = float(os.environ.get("CAPITAL", 30000))
+RISK_PCT = 0.005
+MAX_DAILY_LOSS = CAPITAL * 0.02
+MIN_CONFIDENCE = 6
+IST = pytz.timezone("Asia/Kolkata")
+SYMBOLS = {
+    "NIFTY": {"yahoo": "^NSEI", "interval": 50, "lot": 75, "expiry_day": 1},
+    "BANKNIFTY": {"yahoo": "^NSEBANK", "interval": 100, "lot": 35, "expiry_day": None},
+}
+STRATEGY_RANK = {"TRENDING": 3, "VOLATILE": 2, "SIDEWAYS": 1}
 
-# Verify syntax
-import ast
-ast.parse(code)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+)
+log = logging.getLogger("SignalBot")
 
-print(f"Lines  : {code.count(chr(10))}")
-print(f"Size   : {os.path.getsize('/root/output/main.py'):,} bytes")
-print("Triple quotes : NONE")
-print("Syntax check  : PASSED")
+_lock = threading.Lock()
+regime_state = {name: {"last": None, "count": 0} for name in SYMBOLS}
+state = {
+    "active_trade": None,
+    "pending_signals": {},
+    "daily_loss": 0.0,
+    "current_day": None,
+    "rules_sent": {"open": False, "mid": False, "close": False},
+    "last_heartbeat_hour": -1,
+    "holiday_sent": False,
+}
+
+def get_st(key):
+    with _lock:
+        return state[key]
+
+def set_st(key, val):
+    with _lock:
+        state[key] = val
+
+def _tg(endpoint, payload):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}",
+            json=payload, timeout=10,
+        )
+        return r.json()
+    except Exception as e:
+        log.error(f"Telegram error ({endpoint}): {e}")
+        return {}
+
+def send_text(text):
+    res = _tg("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
+    return res.get("result", {}).get("message_id")
+
+def send_with_buttons(text, signal_id):
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "Take Trade", "callback_data": f"take|{signal_id}"},
+                {"text": "Skip", "callback_data": f"skip|{signal_id}"},
+            ],
+            [{"text": "Remind in 5 min", "callback_data": f"remind|{signal_id}"}],
+        ]
+    }
+    res = _tg("sendMessage", {
+        "chat_id": CHAT_ID, "text": text,
+        "parse_mode": "Markdown", "reply_markup": keyboard,
+    })
+    return res.get("result", {}).get("message_id")
+
+def edit_message(message_id, text, keep_buttons=False):
+    payload = {"chat_id": CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    if not keep_buttons:
+        payload["reply_markup"] = {"inline_keyboard": []}
+    _tg("editMessageText", payload)
+
+def answer_callback(callback_id, text=""):
+    _tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text, "show_alert": False})
+
+def handle_callback(query):
+    cb_id = query["id"]
+    data = query.get("data", "")
+    message_id = query.get("message", {}).get("message_id")
+    if "|" not in data:
+        answer_callback(cb_id, "Unknown action")
+        return
+    action, signal_id = data.split("|", 1)
+    pending = get_st("pending_signals")
+    signal = pending.get(signal_id)
+    if not signal:
+        answer_callback(cb_id, "Signal expired")
+        if message_id:
+            edit_message(message_id, "Signal expired - already handled or timed out.")
+        return
+    if action == "take":
+        with _lock:
+            if state["active_trade"]:
+                ex = state["active_trade"]
+                answer_callback(cb_id, "Trade already open!")
+                edit_message(message_id,
+                    f"Blocked - already have open trade:\n"
+                    f"{ex['symbol']} {ex['atm_strike']} {ex['direction']}\n"
+                    f"Close that first.")
+                return
+            state["active_trade"] = signal
+            del state["pending_signals"][signal_id]
+        answer_callback(cb_id, "Trade logged!")
+        s = signal
+        edit_message(message_id,
+            f"*Trade Taken*\n\n"
+            f"*{s['symbol']}* {s['atm_strike']} {s['direction']}\n"
+            f"Regime: {s['regime']}\nStrategy: {s['strategy']}\n\n"
+            f"Entry est : Rs.{s['atm_prem']} per unit\n"
+            f"Stop Loss : Rs.{s['sl_prem']}\n"
+            f"Target    : Rs.{s['tgt_prem']}\n"
+            f"Lot size  : {s['lot']} units\n\n"
+            f"Bot will notify when SL or Target is hit.")
+        log.info(f"Trade taken: {s['symbol']} {s['atm_strike']} {s['direction']}")
+    elif action == "skip":
+        with _lock:
+            pending.pop(signal_id, None)
+        answer_callback(cb_id, "Skipped")
+        s = signal
+        edit_message(message_id,
+            f"Skipped: {s['symbol']} {s['atm_strike']} {s['direction']}\n"
+            f"Watching for next signal...")
+        log.info(f"Signal skipped: {s['symbol']} {s['atm_strike']} {s['direction']}")
+    elif action == "remind":
+        answer_callback(cb_id, "Will remind at next scan")
+        if message_id:
+            edit_message(message_id,
+                f"Reminder set: {signal['symbol']} {signal['atm_strike']} {signal['direction']}\n"
+                f"Bot will re-alert in ~5 min.", keep_buttons=True)
+    else:
+        answer_callback(cb_id, "Unknown action")
+
+def telegram_polling_thread():
+    log.info("Telegram polling thread started")
+    offset = 0
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 25, "allowed_updates": ["callback_query"]},
+                timeout=30,
+            )
+            for upd in resp.json().get("result", []):
+                offset = upd["update_id"] + 1
+                if "callback_query" in upd:
+                    try:
+                        handle_callback(upd["callback_query"])
+                    except Exception as e:
+                        log.error(f"Callback error: {e}")
+        except requests.exceptions.Timeout:
+            pass
+        except Exception as e:
+            log.error(f"Polling thread error: {e}")
+            time.sleep(5)
+
+def compute_indicators(df):
+    df = df.copy()
+    df["ema9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["Close"].ewm(span=21, adjust=False).mean()
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df["rsi"] = 100 - (100 / (1 + gain / loss.replace(0, 1e-9)))
+    df["atr"] = (df["High"] - df["Low"]).rolling(10).mean()
+    cum_vol = df["Volume"].cumsum()
+    cum_pv = (df["Close"] * df["Volume"]).cumsum()
+    df["vwap"] = cum_pv / cum_vol.replace(0, 1e-9)
+    return df
+
+def detect_regime(df, atr, ema9, ema21):
+    recent = df.iloc[-10:]
+    rng = recent["High"].max() - recent["Low"].min()
+    ema_diff = abs(ema9 - ema21)
+    if ema_diff > atr * 0.6 and rng > atr * 4:
+        return "TRENDING"
+    if ema_diff < atr * 0.3 and rng < atr * 3:
+        return "SIDEWAYS"
+    if rng > atr * 5:
+        return "VOLATILE"
+    return "NORMAL"
+
+def confirm_regime(symbol, new_regime):
+    rs = regime_state[symbol]
+    if rs["last"] == new_regime:
+        rs["count"] += 1
+    else:
+        rs["last"] = new_regime
+        rs["count"] = 1
+    return new_regime if rs["count"] >= 2 else None
+
+def strategy_breakout(df, atr, ema9, ema21, rsi, vwap):
+    orb_high = float(df.iloc[:3]["High"].max())
+    orb_low = float(df.iloc[:3]["Low"].min())
+    close = float(df.iloc[-1]["Close"])
+    conf = 0
+    if close > orb_high or close < orb_low:
+        conf += 3
+    if (ema9 > ema21 and close > orb_high) or (ema9 < ema21 and close < orb_low):
+        conf += 3
+    if (rsi > 55 and close > orb_high) or (rsi < 45 and close < orb_low):
+        conf += 2
+    if conf < MIN_CONFIDENCE:
+        return None
+    if close > orb_high and close > vwap and ema9 > ema21:
+        return "CE", close, close - atr, close + atr * 2, conf
+    if close < orb_low and close < vwap and ema9 < ema21:
+        return "PE", close, close + atr, close - atr * 2, conf
+    return None
+
+def strategy_range_trade(df, atr, ema9, ema21, rsi):
+    recent = df.iloc[-10:]
+    high = float(recent["High"].max())
+    low = float(recent["Low"].min())
+    close = float(df.iloc[-1]["Close"])
+    buffer = atr * 0.3
+    conf = 0
+    if abs(ema9 - ema21) < atr * 0.3:
+        conf += 3
+    if close <= low + buffer or close >= high - buffer:
+        conf += 3
+    if (close <= low + buffer and rsi < 40) or (close >= high - buffer and rsi > 60):
+        conf += 2
+    if conf < MIN_CONFIDENCE:
+        return None
+    if close <= low + buffer:
+        return "CE", close, close - atr * 0.8, close + atr * 1.2, conf
+    if close >= high - buffer:
+        return "PE", close, close + atr * 0.8, close - atr * 1.2, conf
+    return None
+
+def strategy_momentum(df, atr, rsi):
+    last = df.iloc[-1]
+    body = abs(float(last["Close"]) - float(last["Open"]))
+    rng = float(last["High"]) - float(last["Low"])
+    close = float(last["Close"])
+    conf = 0
+    
